@@ -1,0 +1,22 @@
+# Local SQL Server 2022 Developer for the XML load experiment.
+# The sa password comes from the .env file (copy .env.example to .env first).
+services:
+  sql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: uxl-sql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: "Developer"
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in .env}"
+    ports:
+      - "14333:1433"
+    volumes:
+      - uxl-sql-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q \"SELECT 1\" -b -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  uxl-sql-data:

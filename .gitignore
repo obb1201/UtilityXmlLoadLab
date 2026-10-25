@@ -1,0 +1,15 @@
+# Build output
+bin/
+obj/
+*.user
+.vs/
+
+# Local secrets and environment
+.env
+
+# Real (anonymized) XML samples must never be committed
+samples-real/*
+!samples-real/README.md
+
+# Benchmark output
+benchmark-results/

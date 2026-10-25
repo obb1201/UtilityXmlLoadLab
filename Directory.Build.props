@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <!-- All hosts share one user-secrets store, so the SQL password is set once. -->
+    <UserSecretsId>utility-xml-load-lab</UserSecretsId>
+  </PropertyGroup>
+</Project>
