@@ -1,20 +1,95 @@
 # UtilityXmlLoadLab
 
-A local experiment for a **one-time load of ~1 million SAP IS-U style XML messages** into SQL Server.
-It compares two ways to turn the XML into rows, and proves the data arrived complete and correct
-before anything reaches the final database:
+**Load ~1 million SAP IS-U style XML messages into SQL Server once, and prove the data arrived
+complete and correct before anyone relies on it.**
 
-- **A: T-SQL shredding.** `usp_ShredBatch` uses `xml.nodes()` with nested `CROSS APPLY`.
-- **B: .NET parsing.** `XmlReader` (streaming), then `DataTable`, then `SqlBulkCopy`, with configurable parallelism.
-
-Both approaches write to the **same** staging and evidence tables, through the same shared
-begin/finalize procedures. The benchmark checks that they produce identical output.
+A working lab that compares two ways to load the messages (T-SQL shredding and .NET streaming plus
+bulk copy), with an evidence trail, an approval gate, and measured results. It was built with an
+AI coding agent (Claude Code) as an exercise in **agentic engineering**: clear specs, explicit
+rules, and automatic checks that keep the agent's work honest.
 
 All data is synthetic (generated with Bogus). No real customer or company data is used anywhere.
 
-Results: see [docs/BENCHMARK-RESULTS.md](docs/BENCHMARK-RESULTS.md).
+| | |
+|---|---|
+| **Stack** | .NET 10, SQL Server 2022 (Docker), CoreWCF, Microsoft.Data.SqlClient, Bogus, xUnit |
+| **Result** | 1M messages staged in about **2 minutes** (projected from 100k), every message accounted for |
+| **Recommendation** | .NET parsing (B): 2 to 3 times faster than T-SQL (A), and half the SQL Server CPU |
 
-## How it fits together
+## 1. The problem
+
+A one-time migration has no "fix it in the next run". The questions that matter are:
+
+- **Translation:** SAP sends nested XML (header plus repeating segments, 2 to 3 levels deep). The
+  target is flat relational tables with primary and foreign keys.
+- **Trust:** can we show that every message was received, nothing was dropped silently, and every
+  failure was caught and explained, before data reaches the final database?
+- **Risk control:** can a bad batch be stopped, fixed and rerun without touching final data?
+- **Time window:** does the load fit a cutover window?
+- **Evidence over opinion:** should the XML be parsed in T-SQL or in .NET? Measure it, on the same
+  data, with the same checks.
+
+The priority is **completeness and auditability first, then speed**.
+
+## 2. Demo
+
+Five commands take you from an empty database to promoted, reconciled data
+(see [Run it](#6-run-it) for setup):
+
+```powershell
+generator --count 10000 --reset    # 10k synthetic messages, ~1% each of 4 fault kinds injected
+benchmark --dops 1,4,8             # runs A and B at 1, 4 and 8 batches in parallel, compares output
+loader check                       # cross-message checks: orphans, double-installed meters, overlaps
+loader approve --auto              # approves only batches with no failures and no findings
+loader promote --all               # MERGE into the target database, in dependency order
+loader report                      # summary, completeness, reconciliation
+```
+
+Benchmark result for 10k messages (recorded run; full report in
+[docs/benchmarks/benchmark-10k.md](docs/benchmarks/benchmark-10k.md)):
+
+| Approach | DOP | Elapsed | Msgs/s | Avg SQL CPU | Failed batches |
+|---|---:|---:|---:|---:|---:|
+| A: T-SQL shredding | 1 | 11.05 s | 905 | 96% | 0 |
+| A: T-SQL shredding | 8 | 2.31 s | 4,328 | 388% | 0 |
+| B: .NET XmlReader + SqlBulkCopy | 1 | 3.92 s | 2,552 | 41% | 0 |
+| B: .NET XmlReader + SqlBulkCopy | 8 | 1.31 s | 7,642 | 304% | 0 |
+
+DOP is the number of batches run at once. CPU is in % of one core.
+
+What the demo proves:
+- **Same output:** all runs write identical staging and evidence data, checked by row count and
+  content checksum per table.
+- **Every fault caught:** each of the 300 injected faults is recorded in a test manifest, and the
+  completeness report shows it was caught.
+- **Promotion reconciles:** for each batch and table, staged = promoted + superseded + excluded.
+
+The 100k results, the 1M projection and the analysis are in
+[docs/BENCHMARK-RESULTS.md](docs/BENCHMARK-RESULTS.md).
+
+## 3. My contribution
+
+I owned the problem, the rules and the validation. The code was written by Claude Code under them.
+
+- **Framed the problem.** I wrote the [specification](sap-xml-load-experiment-prompt.md): the
+  real goal (proof of completeness, not "SQL vs .NET"), the domain, the edge cases, the fault
+  injection and the success criteria.
+- **Set the rules.** [CLAUDE.md](CLAUDE.md) holds the constraints the agent must follow: the team
+  C# standard, parameterized and idempotent SQL, strict data privacy, and the invariants that span
+  components.
+- **Made the decisions.** Target framework, batch size, message mix and scope, plus review of the
+  design choices below.
+- **Designed the validation.** The output is checked by machines, not by trust: fingerprint
+  comparison of A and B, a fault manifest with known answers, a completeness report, and unit
+  tests.
+- **Drove the investigation.** Parallel batches deadlocked. We found three separate root causes,
+  fixed them, and proved the fix with 20 clean parallel runs. Write-up:
+  [docs/DEADLOCK-ANALYSIS.md](docs/DEADLOCK-ANALYSIS.md).
+
+How I practise agentic engineering on this project (harness, context, skills, validation):
+[docs/AGENTIC-ENGINEERING.md](docs/AGENTIC-ENGINEERING.md).
+
+## 4. Architecture
 
 ```
 Generator ──SOAP──► CoreWCF Receiver ──► SapStaging.dbo.Inbox (raw XML, no parsing)
@@ -23,199 +98,98 @@ Generator ──SOAP──► CoreWCF Receiver ──► SapStaging.dbo.Inbox (r
                                                            │
              A: usp_ShredBatch (T-SQL)   or   B: XmlReader + SqlBulkCopy (.NET)
                                                            │
-                 staging tables (stg.*)  +  LoadEvidence_Message / LoadEvidence_Batch
+                 staging tables (stg.*)  +  evidence tables (LoadEvidence_*)
                                                            │
             usp_CheckReferences ──► usp_ApproveBatch ──► usp_PromoteBatches (MERGE)
                                                            │
                                          SapTarget (full primary and foreign keys)
 ```
 
+- **Receive:** the receiver stores MessageId, raw XML and arrival time, and returns. It does no
+  parsing, so receipt never fails because of content. Duplicates are recorded, not lost.
+- **Stage:** A and B parse a batch of 1,000 messages into the **same** staging tables. Shared
+  begin and finalize procedures write the evidence, so both approaches are judged the same way.
+- **Check:** cross-message checks find orphans, meters installed in two places at once, and
+  overlapping contracts. Each finding points to the MessageId that carried the row.
+- **Approve and promote:** only approved batches are promoted, in batch order and in dependency
+  order (Customer → Account → Premise → Installation → Meter → Contract → Agreement → MoveInOut →
+  Payment). Every row's outcome is recorded.
+
+| Evidence | What it proves |
+|---|---|
+| `LoadEvidence_Message` | One row per arrival: SHA2_256 hash of the raw XML, expected vs staged rows, Passed / Failed / Duplicate, error detail |
+| `LoadEvidence_Batch` | Per batch: counts, findings, status (Staged / Approved / Promoted / Rejected), who approved and when |
+| `LoadEvidence_Finding` | Each referential or business finding, with its MessageId |
+| `LoadEvidence_Promotion` | Per batch and table: staged = promoted + superseded + excluded |
+
 | Folder | What it is |
 |---|---|
 | `src/UtilityXmlLoadLab.Core` | Mapping (`StagingMap.cs`: XML paths to staging columns), message models |
-| `src/UtilityXmlLoadLab.DataAccess` | SQL access: Inbox, bulk writer, gate, benchmark, script deployer |
-| `src/UtilityXmlLoadLab.Business` | .NET parser and validator, batch runner, generator, fault injector, benchmark |
-| `src/UtilityXmlLoadLab.Generator` | Console: generate messages and deliver them |
-| `src/UtilityXmlLoadLab.Receiver` | CoreWCF service: `SubmitMessage(messageId, rawXml)` |
-| `src/UtilityXmlLoadLab.Loader` | Console: deploy DB, batches, load A/B, check, approve, promote, reports |
-| `src/UtilityXmlLoadLab.Benchmark` | Console: run A and B over the same data and compare |
+| `src/UtilityXmlLoadLab.DataAccess` | SQL access: Inbox, bulk writer, approval gate, benchmark, script deployer |
+| `src/UtilityXmlLoadLab.Business` | Parser and validator, batch runner, generator, fault injector, benchmark |
+| `src/UtilityXmlLoadLab.{Generator,Receiver,Loader,Benchmark}` | The four apps (console and CoreWCF service) |
 | `tests/UtilityXmlLoadLab.Tests` | Unit tests (field rules, parser, generator) |
 | `sql/` | Numbered, idempotent scripts (run in name order) |
-| `samples-real/` | Git-ignored folder for anonymized real samples, if ever needed |
 
-## Setup
+## 5. Key decisions
 
-Requirements: Docker Desktop and the .NET 10 SDK. The SDK that ships with .NET 11 also works; the projects target `net10.0`.
+| Decision | Why | Trade-off |
+|---|---|---|
+| Staging has no foreign keys; the target has full keys | Messages arrive in any order, and a reference can point to a later message | References are checked by a separate step, and promotion must follow dependency order |
+| Raw XML stored as text (`nvarchar(max)`), not `xml` | A malformed message must still be stored and get evidence, instead of being refused at the door | Each approach converts to XML itself |
+| All-or-nothing per message | A half-loaded message is worse than a failed one | One bad field fails the whole message |
+| Expected row count is counted separately from the mapping | A segment the mapping misses makes the message fail instead of disappearing | The count logic must stay simple and independent |
+| Both approaches share the evidence procedures | A fair comparison, and a fingerprint check that proves identical output | B must apply exactly the same field rules as A |
+| Auto-approve only when there are no failures and no findings | Anything unusual needs a person, and their approval is recorded | More manual steps on dirty data |
+| Latest version wins on promotion, by message creation time | Messages arrive out of order; an older message must never overwrite newer data | Needs a source timestamp on every target row |
+| Parallel lock rules: BatchId indexes, no page locks, `MAXDOP 1` per batch | Parallel batches deadlocked without them | Rules must be followed in every new statement |
+| **Recommend B at DOP 4 to 8, keep A as a cross-check** | B is 2 to 3 times faster and uses half the SQL Server CPU; A gives a cheap second opinion on the mapping | The mapping lives in two places |
 
-1. **Start SQL Server 2022.**
-   ```powershell
-   Copy-Item .env.example .env        # then edit .env and choose a strong password
-   docker compose up -d               # SQL Server on localhost,14333
-   ```
-2. **Store the same password for the .NET apps** (user secrets; set once, shared by all apps):
-   ```powershell
-   dotnet user-secrets set Sql:Password "<your password>" --project src/UtilityXmlLoadLab.Loader
-   ```
-   You can also set the environment variable `UXL_Sql__Password` instead. The connection string
-   (without the password) is in each app's `appsettings.json`.
-3. **Build and create the databases** (runs every `sql/*.sql` script in order; safe to repeat):
-   ```powershell
-   dotnet build
-   dotnet run --project src/UtilityXmlLoadLab.Loader -- deploy-db
-   ```
+More detail on each decision: [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
-The shorthand `loader`, `generator` and `benchmark` below means
-`dotnet run --project src/UtilityXmlLoadLab.<Name> --`.
+## 6. Run it
 
-## Generate data
+Requirements: Docker Desktop and the .NET 10 SDK.
 
 ```powershell
-generator --count 10000 --reset                 # direct insert into the Inbox (fast)
-```
-
-- **Message mix:** 6 mixed message types: `CUSTOMER_MASTER` (customer, addresses, account),
-  `PREMISE_MASTER` (premise, installations, meters, registers), `MOVE_IN` / `MOVE_OUT` (move event,
-  contracts, agreements), `METER_SWAP` (removed and installed meter), and `PAYMENT_BATCH`.
-- **Realism:** references are consistent and ratios are realistic. Messages arrive slightly out of
-  order, so references often point to a later message. Some move-outs arrive before their move-in.
-  Meters are swapped and contracts can have open end dates.
-- **Faults:** `--fault-rate 0.01` (default) injects about 1% each of malformed XML, a missing
-  required element, a bad date or decimal, and a duplicate MessageId.
-  `--business-fault-rate 0.002` adds overlapping contracts and meters installed twice.
-- **Test manifest:** every injected fault is recorded in `dbo.TestManifest`, so the completeness
-  report can prove each one was caught.
-- **Batches:** the generator puts the messages into batches of 1,000 at the end
-  (`--batch-size`, or `--no-batches`).
-- **Same seed, same data:** `--seed` (default 42) makes runs repeatable.
-
-To go through the **CoreWCF receiver** instead:
-
-```powershell
-dotnet run --project src/UtilityXmlLoadLab.Receiver     # http://localhost:5080/InboxService.svc (?wsdl)
-generator --count 10000 --reset --target wcf --send-parallel 8
-```
-
-The receiver does no parsing. It stores MessageId, raw XML and ReceivedAt. A duplicate MessageId is
-recorded in `dbo.InboxDuplicate` and still returns success (`Duplicate`).
-
-## Run each approach
-
-```powershell
-loader load --approach A            # T-SQL. dop 1 = the SQL Agent-style driver procedure
-loader load --approach A --dop 8    # T-SQL, 8 batches side by side (separate sessions)
-loader load --approach B --dop 8    # .NET XmlReader + SqlBulkCopy, 8 batches side by side
-loader reset-staging                # empty staging + evidence (Inbox and batches stay)
-```
-
-- **Batches and failures:** each batch is one transaction. A batch that fails is rolled back, logged
-  in `dbo.LoadRunBatch`, and reported; the run goes on. By default only batches not yet staged are
-  loaded. `--reload` also reloads batches that are Staged.
-- **Approach A from SQL:** you can also run A directly (for example as a SQL Agent job step):
-  `EXEC SapStaging.dbo.usp_RunShredDriver;`
-
-## Check, approve and promote
-
-```powershell
-loader check                                     # cross-entity checks over all staged batches
-loader approve --auto                            # approves only perfectly clean batches
-loader approve --batch 3 --by "your name"        # manual approval (failures/findings allowed, recorded)
-loader reject  --batch 3 --by "your name" --reason "..."
-loader promote --all                             # or --batch 3, or --from 2 --to 8
-```
-
-Rules enforced by the procedures:
-
-- **Approval:**
-  - Approval needs a current reference check. Staging or rejecting a batch afterwards makes the
-    check out of date.
-  - Auto-approve requires `FailedCount = 0` and no findings at all.
-  - Manual approval records the counts in `ApprovalNote`.
-- **Promotion:**
-  - Only Approved batches are promoted, **in batch order**.
-  - A batch that references an entity found only in a later batch has `DependsOnBatchId` set.
-    Promote a range that includes that later batch (`--from/--to` or `--all`).
-  - Promotion runs in dependency order (Customer → Account → Premise → Installation → Meter →
-    Contract → Agreement → MoveInOut → Payment) as set-based `MERGE`.
-  - The latest version of an entity wins (by message `CreatedAt`), and an older message never
-    overwrites newer target data.
-  - Rows from failed messages and rows with an **Error** finding are never promoted.
-
-## Read the evidence
-
-```powershell
-loader report                    # summary + completeness + reconciliation
-loader report completeness       # every line should read OK
-```
-
-| Table / view | What it proves |
-|---|---|
-| `dbo.LoadEvidence_Message` | One row per arrival: SHA2_256 hash of the raw XML, expected vs staged rows, Passed / Failed / Duplicate, error detail |
-| `dbo.LoadEvidence_Batch` | Per batch: counts, findings, status (Staged / Approved / Promoted / Rejected), who approved and when |
-| `dbo.LoadEvidence_Finding` | Each referential or business finding, with the MessageId that carried the row |
-| `dbo.LoadEvidence_Promotion` | Per batch and table: staged = promoted + superseded + excluded |
-| `dbo.vw_BatchReconciliation` | Staged vs promoted per batch, with an OK / MISMATCH result |
-| `dbo.LoadRun`, `dbo.LoadRunBatch` | Every load run and batch, with timing and errors |
-
-How "nothing was lost" is shown:
-
-- **Every message is accounted for:**
-  - Every Inbox message gets exactly one evidence row. `usp_FinalizeBatch` throws if not.
-  - Every duplicate arrival is recorded.
-  - The stored hash is re-checked against the Inbox.
-- **Every segment is accounted for:** the expected row count of a message is every segment element
-  anywhere in the XML, counted separately from the mapping. A segment in an unexpected place, or in
-  a message type that does not carry it, makes the message fail instead of disappearing.
-- **All-or-nothing per message:** a message with any problem stages no rows.
-
-Example queries:
-
-```sql
-SELECT * FROM SapStaging.dbo.LoadEvidence_Message WHERE ValidationStatus <> 'Passed';
-SELECT * FROM SapStaging.dbo.LoadEvidence_Finding WHERE MessageId = '<id>';
-SELECT * FROM SapStaging.dbo.vw_BatchReconciliation;
-```
-
-## Benchmark
-
-```powershell
-generator --count 10000 --reset
-benchmark --dops 1,4,8                     # add --no-cpu to skip docker stats sampling
-```
-
-For each approach and DOP (degree of parallelism: how many batches run at once), the benchmark:
-
-1. resets staging,
-2. runs the load,
-3. measures elapsed time, msgs/s, rows/s, peak and average SQL Server container CPU
-   (`docker stats`), and client CPU,
-4. fingerprints every staging and evidence table.
-
-It then prints a comparison with a 1M projection and writes it to `benchmark-results/` (git-ignored).
-It exits with code 1 if any run differs from the others or a batch failed. Staging is left with the
-last run's output, so you can go on with `check`, `approve` and `promote`.
-
-## Tests
-
-```powershell
+Copy-Item .env.example .env              # then set a strong SA password in .env
+docker compose up -d                     # SQL Server 2022 on localhost,14333
+dotnet user-secrets set Sql:Password "<same password>" --project src/UtilityXmlLoadLab.Loader
+dotnet build
+dotnet run --project src/UtilityXmlLoadLab.Loader -- deploy-db    # creates both databases (safe to repeat)
 dotnet test
 ```
 
-## Notes and known limits
+The password can also come from the environment variable `UXL_Sql__Password`. All apps share one
+user-secrets store.
 
-- **Raw XML as text:** `Inbox.RawXml` is `nvarchar(max)`, not `xml`. The spec says `xml`, but a
-  malformed message could then not be stored at all, and it would be lost without evidence.
-- **No XML declaration:** messages must not have an `encoding="utf-8"` XML declaration.
-  SQL Server cannot convert such an `nvarchar` to `xml`. Strip it at the receiver if real messages
-  carry one.
-- **Mapping in two places:** the XML-to-table mapping lives in `StagingMap.cs` (B) and
-  `usp_ShredBatch` (A). Change both; the benchmark fingerprint shows any difference.
-- **Strict value rules:** both approaches accept exactly the same values:
-  - dates `yyyy-MM-dd`,
-  - date-times `yyyy-MM-ddTHH:mm:ss`,
-  - decimals with a dot and at most 2 decimal places.
+Below, `loader`, `generator` and `benchmark` mean
+`dotnet run --project src/UtilityXmlLoadLab.<Name> --`.
 
-  Anything else fails the message rather than being silently rounded or guessed.
-- **Lock rules for parallel batches:** every per-batch statement reaches rows through its
-  `BatchId` index, page locks are off on the shared tables, and per-batch statements use
-  `MAXDOP 1`. Without this, parallel batches deadlocked. See
-  [docs/DEADLOCK-ANALYSIS.md](docs/DEADLOCK-ANALYSIS.md).
+| Task | Command |
+|---|---|
+| Generate data (direct insert) | `generator --count 10000 --reset` (options: `--fault-rate`, `--business-fault-rate`, `--seed`, `--batch-size`) |
+| Generate data through CoreWCF | start `dotnet run --project src/UtilityXmlLoadLab.Receiver`, then `generator --count 10000 --reset --target wcf --send-parallel 8` |
+| Load with A or B | `loader load --approach A --dop 8` or `loader load --approach B --dop 8` |
+| Run A from SQL (for example a SQL Agent job) | `EXEC SapStaging.dbo.usp_RunShredDriver;` |
+| Check, approve, promote | `loader check`, `loader approve --auto`, `loader promote --all` |
+| Manual approval or rejection | `loader approve --batch 3 --by "name"`, `loader reject --batch 3 --by "name" --reason "..."` |
+| Reports | `loader report`, `loader report completeness` (every line should read OK) |
+| Benchmark | `benchmark --dops 1,4,8` (writes a report to `benchmark-results/`) |
+| Start again | `loader reset-staging` |
+
+## 7. Limitations
+
+- **Synthetic data.** Messages are about 2 KB. Real IDocs can be larger and deeper, which costs A
+  more than B. Re-run the benchmark on anonymized real samples before deciding.
+- **One machine.** The client and SQL Server share 16 CPUs. On separate servers, B would likely
+  gain more.
+- **Projections.** The 1M numbers are scaled up from 100k. The reference check and promotion work
+  across all batches and should be measured at 1M (`generator --count 1000000` is supported).
+- **Mapping in two places.** `StagingMap.cs` (B) and `usp_ShredBatch` (A) must be changed together.
+  The benchmark fingerprint shows any difference.
+- **No XML declaration.** SQL Server cannot convert an `nvarchar` that has an
+  `encoding="utf-8"` declaration to `xml`. Real messages would need it stripped at the receiver.
+- **Strict value rules.** Only `yyyy-MM-dd` dates, `yyyy-MM-ddTHH:mm:ss` date-times and decimals
+  with a dot and at most 2 places are accepted. Anything else fails the message.
+- **Lab only.** The receiver has no authentication or TLS. It is not meant for production use.

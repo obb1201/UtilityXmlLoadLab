@@ -8,6 +8,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - If a requirement is unclear, ask the user key questions before proceeding.
 - Record changes in the change log in the `docs/` folder (`docs/CHANGELOG.md`). Add an entry whenever you make a notable change.
 
+## Main goal: learning agentic engineering
+
+The main goal of this project is for the user to understand **agentic engineering**: how to get reliable work from AI tools. The XML load experiment is the realistic workload to practise on. There are four topics:
+
+1. **Agentic harness:** the agent loop and its tools, permissions, hooks, subagents, plan mode, worktrees and workflows.
+2. **Context engineering:** what the agent sees and when, such as CLAUDE.md, the spec, docs, memory, compaction and subagent isolation.
+3. **Skills and rules:** reusable instructions such as skills, slash commands, the team coding standard and the rules in this file.
+4. **Agentic validation:** the work, check, fix loop, and evals that prove an agent's output is right.
+
+When you work here:
+
+- When it helps, say in one or two lines which topic a step belongs to, and why you chose that approach.
+- **Close the loop.** After a change, run the matching check (build, tests, `deploy-db`, benchmark fingerprint, completeness report). Report the result as it is, including failures.
+- When a task is a good chance to practise one of the topics, suggest it briefly. Do not build harness pieces unless the user asks.
+- Put harness pieces in this repo, under `.claude/` (`settings.json`, `skills/`, `agents/`), so they can be read and changed like code.
+- The practice list in [docs/AGENTIC-ENGINEERING.md](docs/AGENTIC-ENGINEERING.md) records ideas. Mark an item as done there when it is built.
+- The data privacy rules below apply to harness pieces too: no real data in prompts, hooks, skills, evals or logs.
+
 ## Project status
 
 The specification is [sap-xml-load-experiment-prompt.md](sap-xml-load-experiment-prompt.md). It is the source of truth for scope. The first working version is built and benchmarked: see [README.md](README.md), [docs/BENCHMARK-RESULTS.md](docs/BENCHMARK-RESULTS.md), and the design decisions in [docs/CHANGELOG.md](docs/CHANGELOG.md).

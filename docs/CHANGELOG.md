@@ -2,6 +2,30 @@
 
 Notable changes to this project. Newest entries first.
 
+## 2026-10-25 (README as a portfolio page)
+
+- Rewrote the README for readers outside the project. Sections: problem, demo, my contribution,
+  architecture, key decisions, run it, limitations.
+- Moved the agentic engineering practice list to [AGENTIC-ENGINEERING.md](AGENTIC-ENGINEERING.md);
+  `CLAUDE.md` now links there.
+
+## 2026-10-25 (main goal: agentic engineering)
+
+- The main goal of the project is now learning agentic engineering, in four topics: agentic
+  harness, context engineering, skills and rules, and agentic validation (work, check, fix, and
+  evals). The XML load experiment is the workload for practice.
+- `CLAUDE.md`: the "Second goal" section became "Main goal: learning agentic engineering". It
+  adds a rule to close the loop: after a change, run the matching check and report the result.
+- README: the practice list is grouped by the four topics. It also lists the checks this
+  project already has (fingerprint, completeness report, tests, the deadlock fix loop).
+
+## 2026-10-25 (learning goal)
+
+- Added a second project goal: learning the Claude Code agentic harness. `CLAUDE.md` now says how
+  Claude should support this. The README has a new section, "Learning the agentic harness", with a
+  list of practice ideas (permissions, hooks, skills, subagents, plan mode, code review, memory,
+  worktrees, workflows). None of these is built yet.
+
 ## 2026-10-25 (documentation)
 
 - Added [DEADLOCK-ANALYSIS.md](DEADLOCK-ANALYSIS.md): the three causes of the parallel-load
